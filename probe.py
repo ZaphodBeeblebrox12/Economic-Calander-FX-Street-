@@ -22,6 +22,8 @@ Logs:
 import hashlib
 import html
 import json
+import math
+import re
 import logging
 import logging.handlers
 import os
@@ -267,6 +269,34 @@ _UPCOMING_JS = r"""
 })()
 """
 
+_NEXTUP_JS = r"""
+(() => {
+  const out = [];
+  let day = '';
+  const trs = Array.from(document.querySelectorAll('tr'));
+  for (const tr of trs) {
+    const cls = tr.className || '';
+    if (/day/i.test(cls) && cls.indexOf('fxs_c_row') === -1) {
+      const t = (tr.textContent || '').trim().replace(/\s+/g, ' ');
+      if (t) day = t;
+      continue;
+    }
+    if (cls.indexOf('fxs_c_row') === -1) continue;
+    const t = ((tr.querySelector('.fxs_c_time')||{}).textContent || '').trim();
+    const cur = ((tr.querySelector('.fxs_c_currency')||{}).textContent || '').trim();
+    const name = ((tr.querySelector('.fxs_c_name')||{}).textContent || '').trim().replace(/\s+/g, ' ');
+    const flagEl = tr.querySelector('.fxs_c_flag [title]');
+    const country = flagEl ? flagEl.getAttribute('title') : '';
+    const m = ((tr.querySelector('.fxs_c_impact-icon')||{}).className || '').match(/fxs_c_impact-(high|medium|low)/);
+    const allday = /all day/i.test(t);
+    out.push({kind: allday ? 'allday' : 'timed', day, time: t,
+              currency: cur, name: name, country: country,
+              impact: m ? m[1] : (allday ? 'none' : '')});
+  }
+  return JSON.stringify(out);
+})()
+"""
+
 class Health:
     STARTING, BOOTSTRAPPING, PAGE_READY, LIVE, DEGRADED, RECOVERING, FAILED = range(7)
     NAMES = {0: "STARTING", 1: "BOOTSTRAPPING", 2: "PAGE_READY", 3: "LIVE",
@@ -331,6 +361,8 @@ class Probe:
         self.pw = None
         self._console_budget = deque(maxlen=5)
         self._last_cmd_mono = 0
+        self._last_pre_scan = 0
+        self._pre_alerted = {}
 
     # ------------------------------------------------------------ main
     def run(self):
@@ -817,6 +849,16 @@ class Probe:
 
     # ------------------------------------------------------------ periodic checks
     def _tick(self):
+        # --- pre-release heads-up alerts (default: 30 min before) ---
+        if getattr(C, "PRE_ALERT_ENABLED", False):
+            now0 = mono_ms()
+            if now0 - getattr(self, "_last_pre_scan", 0) >= 30_000:
+                self._last_pre_scan = now0
+                try:
+                    self._pre_alert_scan()
+                except Exception:
+                    pass
+
         now = mono_ms()
         h = self.health
 
@@ -1118,9 +1160,56 @@ class Probe:
             return f"\u2705 Beat by +{self._fmt_num(d)}"
         return f"\u274C Miss by -{self._fmt_num(abs(d))}"
 
+    # -------- subscriber-facing name normalization (source-neutral) --------
+    # generic patterns - cover the whole year, not just this week's rows.
+    # user-extensible via CUSTOM_NAME_RULES in config.py without code edits.
+    _NAME_RULES = [
+        (r"\bStocks Change\b", "Inventories"),       # EIA/API: any product
+        (r"\bStorage Change\b", "Storage"),
+        (r"\bCrude Oil Stock\b", "Crude Oil Inventories"),
+        (r"^Baker Hughes ", ""),                       # "Baker Hughes US Oil Rig Count" -> "US Oil Rig Count"
+        (r"^(.*?)'s (.+?) speech$", r"\1's \2 Speaks"),
+    ]
+    _HOLIDAY_COUNTRY = {"AUD": "Australia", "CAD": "Canada", "CNY": "China",
+                        "HKD": "Hong Kong", "JPY": "Japan", "NZD": "New Zealand",
+                        "USD": "United States", "CHF": "Switzerland",
+                        "EUR": "Eurozone", "GBP": "United Kingdom",
+                        "INR": "India", "BRL": "Brazil", "MXN": "Mexico",
+                        "ZAR": "South Africa", "SGD": "Singapore",
+                        "KRW": "South Korea", "SEK": "Sweden", "NOK": "Norway",
+                        "DKK": "Denmark"}
+    _COUNTRY_WORDS = ("german", "spanish", "canadian", "chinese", "japanese",
+                      "australian", "italian", "french", "american", "british",
+                      "swiss", "indian", "mexican", "brazilian", "korean",
+                      "swedish", "norwegian", "danish", "eurozone", "european",
+                      "hong kong", "new zealand", "u.s.", "us ", "uk ")
+
+    def _display_name(self, ev: dict) -> str:
+        """Normalize house-specific event names to conventional market
+        naming so the feed reads source-neutral to subscribers."""
+        name = str(ev.get("event_name") or "Unknown event")
+        if not getattr(C, "DISPLAY_NEUTRAL_NAMES", True):
+            return name
+        for pat, rep in self._NAME_RULES:
+            name = re.sub(pat, rep, name)
+        for pat, rep in getattr(C, "CUSTOM_NAME_RULES", ()):
+            name = re.sub(pat, rep, name)
+        # all-day rows: one house style omits the country ("National Day"),
+        # conventional calendars include it ("China - National Day")
+        is_speech = name.endswith("Speaks")
+        no_values = not (ev.get("forecast") or "").strip() \
+                    and not (ev.get("previous") or "").strip()
+        low_impact = (ev.get("impact") or "").lower() in ("", "none", "holiday")
+        has_country_word = any(w in name.lower() for w in self._COUNTRY_WORDS)
+        if not is_speech and no_values and low_impact and not has_country_word:
+            cname = self._HOLIDAY_COUNTRY.get((ev.get("currency") or "").upper())
+            if cname:
+                name = f"{cname} - {name}"
+        return name
+
     def _card(self, ev: dict) -> str:
         dot = self._IMPACT_DOT.get(str(ev.get("impact") or "").lower(), "\u26AA")
-        name = html.escape(str(ev.get("event_name") or "Unknown event"))
+        name = html.escape(self._display_name(ev))
         head = f"{dot} <b>{name}</b>"
         tail = f"{self._flag(ev)} {ev.get('currency') or ''}".strip()
         if tail:
@@ -1148,6 +1237,70 @@ class Probe:
 
 
     # ---------------- telegram commands (/test, /upcoming) -------------------
+    # ---------------- pre-release heads-up alerts ----------------
+    _MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4,
+               "may": 5, "june": 6, "july": 7, "august": 8,
+               "september": 9, "october": 10, "november": 11, "december": 12}
+
+    def _parse_page_datetime(self, day_text, time_text):
+        """'Monday, October 5' + '12:30 PM' (page is pinned to UTC) -> aware dt."""
+        d = re.match(r"\w+,\s+(\w+)\s+(\d{1,2})", day_text or "")
+        t = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)", (time_text or "").upper())
+        if not d or not t:
+            return None
+        month = self._MONTHS.get(d.group(1).lower())
+        if not month:
+            return None
+        hh = int(t.group(1)) % 12
+        if t.group(3) == "PM":
+            hh += 12
+        return datetime(datetime.now(timezone.utc).year, month,
+                        int(d.group(2)), hh, int(t.group(2)),
+                        tzinfo=timezone.utc)
+
+    def _pre_alert_scan(self):
+        if self.health.state != Health.LIVE or not self.page or self.page.is_closed():
+            return
+        events = json.loads(self.page.evaluate(_NEXTUP_JS))
+        now = datetime.now(timezone.utc)
+        wanted = tuple(x.lower() for x in getattr(C, "PRE_ALERT_IMPACTS", ("high", "medium")))
+        horizon = getattr(C, "PRE_ALERT_MIN", 30) * 60
+        for ev in events:
+            if ev.get("kind") != "timed":
+                continue
+            if (ev.get("impact") or "").lower() not in wanted:
+                continue
+            start = self._parse_page_datetime(ev.get("day"), ev.get("time"))
+            if not start:
+                continue
+            remaining = (start - now).total_seconds()
+            if not (0 <= remaining <= horizon):
+                continue
+            key = (ev.get("name", ""), ev.get("currency", ""),
+                   ev.get("day", ""), ev.get("time", ""))
+            if key in self._pre_alerted:
+                continue
+            self._pre_alerted[key] = None
+            while len(self._pre_alerted) > 300:
+                self._pre_alerted.pop(next(iter(self._pre_alerted)))
+            self._post_pre_alert(ev, remaining, key)
+
+    def _post_pre_alert(self, ev, remaining_s, key):
+        mins = max(1, int(math.ceil(remaining_s / 60)))
+        dot = self._IMPACT_DOT.get((ev.get("impact") or "").lower(), "\u26aa")
+        name = html.escape(self._display_name(ev))
+        tail = f"{self._flag(ev)} {ev.get('currency') or ''}".strip()
+        tail = f" <i>{html.escape(tail)}</i>" if tail else ""
+        day = html.escape(str(ev.get("day") or "").split(",")[-1].strip())
+        when = html.escape(str(ev.get("time") or ""))
+        unit = "minute" if mins == 1 else "minutes"
+        text = (f"\u23f0 <b>Next up in {mins} {unit}</b>\n"
+                f"{dot} {name}{tail}\n"
+                f"<i>{day} \u00b7 {when} page time (UTC)</i>")
+        jlog(log, "pre_alert", event=ev.get("name"),
+             currency=ev.get("currency"), mins=mins)
+        self.tg.alert(text, dedup_key=key)
+
     def _dispatch_cmd(self, cmd: str, chat_id: str, msg_id=None):
         if chat_id != str(C.TELEGRAM_CHAT_ID):
             jlog(log, "tg_cmd_ignored", cmd=cmd, chat=str(chat_id)[:6] + "...")
@@ -1200,22 +1353,33 @@ class Probe:
 
     def _cmd_upcoming(self, chat_id: str):
         try:
-            rows = json.loads(self.page.evaluate(_UPCOMING_JS))
+            rows = json.loads(self.page.evaluate(_NEXTUP_JS))
         except Exception as e:
             self.tg.reply(f"\u26a0\ufe0f Could not read the page: {html.escape(str(e)[:100])}",
                           chat_id)
             return
         if not rows:
-            self.tg.reply("\U0001F4ED No upcoming timed events on the current "
-                          "page (quiet market).", chat_id)
+            self.tg.reply("\U0001F4ED No events on the current page (quiet market).",
+                          chat_id)
             return
-        lines = ["<b>Next up (page time, UTC)</b>"]
-        for r in rows:
-            dot = self._IMPACT_DOT.get((r.get("impact") or "").lower(), "\u26aa")
-            t = html.escape(str(r.get("time") or ""))
-            cur = html.escape(str(r.get("currency") or ""))
-            name = html.escape(str(r.get("name") or ""))
-            lines.append(f"{dot} <i>{t}</i> \u2014 {self._flag(r)} <b>{cur}</b> {name}")
+        timed = [r for r in rows if r.get("kind") == "timed"][:5]
+        allday = [r for r in rows if r.get("kind") == "allday"][:8]
+        lines = []
+        if timed:
+            lines.append("<b>Next up (page time, UTC)</b>")
+            for r in timed:
+                dot = self._IMPACT_DOT.get((r.get("impact") or "").lower(), "\u26aa")
+                t = html.escape(str(r.get("time") or ""))
+                cur = html.escape(str(r.get("currency") or ""))
+                name = html.escape(str(r.get("name") or ""))
+                lines.append(f"{dot} <i>{t}</i> \u2014 {self._flag(r)} <b>{cur}</b> {name}")
+        if allday:
+            if lines:
+                lines.append("")
+            lines.append("<b>Holidays &amp; market hours</b>")
+            for r in allday:
+                name = html.escape(self._display_name(r))   # country-prefixed
+                lines.append(f"\u26aa {name}")
         self.tg.reply("\n".join(lines), chat_id)
 
     def _resource_log(self):

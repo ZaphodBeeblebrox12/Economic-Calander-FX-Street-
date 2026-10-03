@@ -102,6 +102,10 @@ class TelegramNotifier:
     def quiet(self, text):
         self._enqueue(text, category="quiet")
 
+    def alert(self, text, dedup_key=None):
+        """Pre-release heads-up. dedup_key survives restarts (re-alert safe)."""
+        self._enqueue(text, category="alert", dedup_key=dedup_key, force=True)
+
     def reply(self, text, chat_id):
         """Immediate send (bypasses queue). Used for command responses."""
         if not self.enabled:

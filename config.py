@@ -75,7 +75,7 @@ CURRENCIES = ["USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF", "CNY",
 #   ADD:    countries appended to every data fetch (e.g. "IN" = India/INR)
 #   REMOVE: countries stripped from the site default list (e.g. "UA" = Ukraine)
 EXTRA_COUNTRIES = "IN"
-REMOVE_COUNTRIES = "UA", "GR", "BE", "ES", "PH", "TH"
+REMOVE_COUNTRIES = ""
 
 # optional saved site state (filter cookies etc.) written by set_filters.py
 FXS_STATE_FILE = "fxs_state.json"
@@ -133,3 +133,20 @@ PROBE_LOG = LOG_DIR / "probe.jsonl"       # everything (rotating)
 RELEASE_LOG = LOG_DIR / "releases.jsonl"  # release events only (rotating)
 BENCH_OUT = OUT_DIR / "benchmark.jsonl"
 CENSUS_OUT = OUT_DIR / "dom_census.json"
+
+# Normalize house-specific event names (e.g. "EIA Crude Oil Stocks Change"
+# -> "Crude Oil Inventories", "ECB's Nagel speech" -> "Speaks", holidays get
+# country prefix) so subscriber-facing messages read source-neutral.
+DISPLAY_NEUTRAL_NAMES = True
+
+# Your own event-name rewrites, applied after the built-in patterns.
+# List of (regex, replacement). Use when you spot a name that still reads
+# house-specific. Example:
+# CUSTOM_NAME_RULES = [(r"^TD-MI ", "")]
+CUSTOM_NAME_RULES = []
+
+# Pre-release heads-up: post a "Next up in N minutes" message this many
+# minutes before HIGH/MEDIUM releases, then the normal card at release time.
+PRE_ALERT_ENABLED = True
+PRE_ALERT_MIN = 30
+PRE_ALERT_IMPACTS = ("high", "medium")
