@@ -20,6 +20,7 @@ Logs:
 """
 
 import hashlib
+import html
 import json
 import logging
 import logging.handlers
@@ -244,6 +245,28 @@ _STARTUP_SNAPSHOT_JS = r"""(() => {
 })()"""
 
 
+_UPCOMING_JS = r"""
+(() => {
+  const rows = Array.from(document.querySelectorAll('tr.fxs_c_row'));
+  const out = [];
+  for (const r of rows) {
+    const actual = ((r.querySelector('.fxs_c_actual')||{}).textContent || '').trim();
+    if (actual && actual !== '-') continue;              // skip already-released
+    const t = ((r.querySelector('.fxs_c_time')||{}).textContent || '').trim();
+    if (!t || /all day/i.test(t)) continue;              // skip holiday markers
+    const cur = ((r.querySelector('.fxs_c_currency')||{}).textContent || '').trim();
+    const name = ((r.querySelector('.fxs_c_name')||{}).textContent || '').trim().replace(/\s+/g, ' ');
+    const flagEl = r.querySelector('.fxs_c_flag [title]');
+    const country = flagEl ? flagEl.getAttribute('title') : '';
+    const m = ((r.querySelector('.fxs_c_impact-icon')||{}).className || '').match(/fxs_c_impact-(high|medium|low)/);
+    out.push({time: t, currency: cur, name: name, country: country,
+              impact: m ? m[1] : ''});
+    if (out.length >= 3) break;
+  }
+  return JSON.stringify(out);
+})()
+"""
+
 class Health:
     STARTING, BOOTSTRAPPING, PAGE_READY, LIVE, DEGRADED, RECOVERING, FAILED = range(7)
     NAMES = {0: "STARTING", 1: "BOOTSTRAPPING", 2: "PAGE_READY", 3: "LIVE",
@@ -307,6 +330,7 @@ class Probe:
         self.browser = None
         self.pw = None
         self._console_budget = deque(maxlen=5)
+        self._last_cmd_mono = 0
 
     # ------------------------------------------------------------ main
     def run(self):
@@ -314,6 +338,9 @@ class Probe:
         self.start_mono = mono_ms()
         self._last_data_mono = self.start_mono
         self.tg.start()
+        self.tg.start_listener(
+            lambda cmd, chat, mid: self.q.put(
+                ("tg_cmd", {"cmd": cmd, "chat": chat, "mid": mid})))
         if self.tg.enabled:
             jlog(log, "tg_enabled", chat_id=str(C.TELEGRAM_CHAT_ID)[:6] + "...")
         C.OUT_DIR.mkdir(exist_ok=True)
@@ -346,7 +373,11 @@ class Probe:
                 self._tick()
         finally:
             try:
-                self.tg.stop(final_message="🛑 FXStreet probe stopped")
+                self.tg.stop_listener()
+            except Exception:
+                pass
+            try:
+                self.tg.stop(final_message="🛑 Calendar feed stopped")
             except Exception:
                 pass
             jlog(log, "probe_stop", stats=dict(self.stats), tg=self.tg.stats_dict(),
@@ -408,12 +439,25 @@ class Probe:
                 self.context.close()
             except Exception:
                 pass
+        state_file = getattr(C, "FXS_STATE_FILE", "fxs_state.json")
+        state_kw = {}
+        if os.path.exists(state_file):
+            state_kw["storage_state"] = state_file   # saved filter selection
+            jlog(log, "storage_state_loaded", path=state_file)
         self.context = self.browser.new_context(
             user_agent=C.USER_AGENT,
             viewport=C.VIEWPORT,
             locale=C.LOCALE,
             timezone_id=C.TIMEZONE_ID,
+            **state_kw,
         )
+        extra = getattr(C, "EXTRA_COUNTRIES", "")
+        removed = getattr(C, "REMOVE_COUNTRIES", "")
+        if extra.strip() or removed.strip():
+            self.context.route(
+                "**/eventDates/**",
+                lambda route, req: self._add_countries(route, req, extra, removed))
+            jlog(log, "countries_route", add=extra, remove=removed)
         self.context.set_default_timeout(15_000)
         self.context.add_init_script(Path("js/observer.js").read_text(encoding="utf-8"))
         if getattr(C, "MASK_WEBDRIVER", False):
@@ -424,6 +468,33 @@ class Probe:
                 "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
             )
         self._new_page()
+
+    @staticmethod
+    def _add_countries(route, request, extra, removed=""):
+        """Rewrite the calendar data fetch: drop removed countries, append
+        extra ones (e.g. IN for India). The site's Filter panel is bypassed
+        entirely - no clicks, so the checkbox-crash path is never touched."""
+        try:
+            url = request.url
+            for c in removed.split(","):
+                c = c.strip().upper()
+                if c:
+                    url = url.replace(f"&countries={c}", "")
+            adds = "".join(
+                f"&countries={c.strip().upper()}"
+                for c in extra.split(",")
+                if c.strip() and f"countries={c.strip().upper()}" not in url)
+            if adds and "countries=" in url:
+                url = url + adds
+            if url != request.url:
+                route.continue_(url=url)
+                return
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
 
     def _new_page(self):
         if self.page:
@@ -572,6 +643,9 @@ class Probe:
         elif kind == "ws_close":
             jlog(log, "ws_close_event", url=redact(payload.get("url", ""))[:200])
             # a single WS close is normal (idle hubs close); only stale-combo triggers recovery via _tick
+        elif kind == "tg_cmd":
+            self._dispatch_cmd(payload.get("cmd", ""), payload.get("chat", ""),
+                              payload.get("mid"))
 
     def _on_js(self, s: str):
         try:
@@ -674,7 +748,7 @@ class Probe:
             jlog(log, "revision_suppressed", event_key=key, actual=ev.get("actual"),
                  old=ev.get("old_actual"))
             self._mark_data()
-            self.tg.revision(self._revision_message(ev), dedup_key=(key, content_hash))
+            self.tg.revision(self._revision_message(ev), dedup_key=(key, content_hash), edit_key=key)
             return
 
         # correlate with the fastest network observation of the same release
@@ -706,7 +780,7 @@ class Probe:
         }
         releases_log.info(json.dumps(rec, ensure_ascii=False))
         self._mark_data()
-        self.tg.release(self._release_message(rec), dedup_key=(key, content_hash))
+        self.tg.release(self._release_message(rec), dedup_key=(key, content_hash), edit_key=key)
         jlog(log, "release_emitted", event=rec["event_name"], currency=rec["currency"],
              actual=rec["actual"], latency_total_ms=rec["network_to_python_ms"])
         # benchmark file (A/B method comparison)
@@ -779,11 +853,8 @@ class Probe:
                     and now - self._last_quiet_mono > qi * 1000):
                 self._last_quiet_mono = now
                 self.tg.quiet(
-                    f"💤 Quiet {qi // 3600}h — no new releases\n"
-                    f"state {Health.NAMES[self.health.state]} | "
-                    f"{self._last_rows_attached} rows | "
-                    f"ws keepalives {self.stats.get('ws_ping_frames', 0)} | "
-                    f"uptime {fmt_uptime(now - self.start_mono)}")
+                    f"💤 Quiet market — no new releases in the "
+                    f"last {qi // 3600}h")
 
         if now - self.last_resource_log > C.RESOURCE_LOG_S * 1000:
             self.last_resource_log = now
@@ -985,7 +1056,7 @@ class Probe:
             lines = ["• " + s for s in data.get("upcoming", [])[:6]]
         except Exception as e:
             lines.append(f"(snapshot failed: {str(e)[:80]})")
-        body = (f"🟢 FXStreet probe LIVE\n"
+        body = (f"🟢 Calendar feed live\n"
                 f"Calendar: {rows} rows attached\n"
                 f"Next up (page time, UTC):")
         if lines:
@@ -1010,35 +1081,142 @@ class Probe:
         except ValueError:
             return None
 
-    def _beat_miss(self, actual, forecast):
+    # ---------------- subscriber-facing message cards (HTML) ----------------
+    _IMPACT_DOT = {"high": "\U0001F534", "medium": "\U0001F7E0",
+                   "low": "\U0001F7E1", "none": "\u26AA"}
+    _CC_FIX = {"UK": "GB"}   # FXStreet uses UK; flag emoji needs ISO GB
+
+    def _flag(self, ev: dict) -> str:
+        cur = (ev.get("currency") or "").upper()
+        if cur == "XAU":
+            return "\U0001F947"   # gold
+        if cur == "XAG":
+            return "\U0001F948"   # silver
+        if cur == "EUR":
+            return "\U0001F1EA\U0001F1FA"
+        cc = (ev.get("country") or "").upper()[:2]
+        cc = self._CC_FIX.get(cc, cc)
+        if len(cc) == 2 and cc.isalpha():
+            return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in cc)
+        return ""
+
+    @staticmethod
+    def _fmt_num(v: float) -> str:
+        for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+            if abs(v) >= div:
+                return f"{v / div:g}{suf}"
+        return f"{v:g}"
+
+    def _verdict(self, actual, forecast) -> str:
         a, f = self._num(actual), self._num(forecast)
         if a is None or f is None:
             return ""
-        if a > f:
-            return "✅ beat"
-        if a < f:
-            return "❌ miss"
-        return "➖ inline"
+        d = a - f
+        if abs(d) < 1e-12:
+            return "\u2796 Inline with forecast"
+        if d > 0:
+            return f"\u2705 Beat by +{self._fmt_num(d)}"
+        return f"\u274C Miss by -{self._fmt_num(abs(d))}"
+
+    def _card(self, ev: dict) -> str:
+        dot = self._IMPACT_DOT.get(str(ev.get("impact") or "").lower(), "\u26AA")
+        name = html.escape(str(ev.get("event_name") or "Unknown event"))
+        head = f"{dot} <b>{name}</b>"
+        tail = f"{self._flag(ev)} {ev.get('currency') or ''}".strip()
+        if tail:
+            head += f" <i>{html.escape(tail)}</i>"
+        lines = [
+            head,
+            f"<b>{html.escape(str(ev.get('actual')))}</b>",
+            f"<i>Forecast {html.escape(str(ev.get('forecast') or '\u2014'))}"
+            f" \u00b7 Previous {html.escape(str(ev.get('previous') or '\u2014'))}</i>",
+        ]
+        verdict = self._verdict(ev.get("actual"), ev.get("forecast"))
+        if verdict:
+            lines.append(verdict)
+        return "\n".join(lines)
 
     def _release_message(self, rec):
-        lat = rec.get("network_to_python_ms") or rec.get("dom_to_python_ms")
-        lat_s = f" | detected {lat} ms after update" if lat else ""
-        bm = self._beat_miss(rec.get("actual"), rec.get("forecast"))
-        bm_s = f" | {bm}" if bm else ""
-        impact = f" | {rec['impact']}" if rec.get("impact") else ""
-        when_s = f" | {rec['scheduled_time']}" if rec.get("scheduled_time") else ""
-        cur = rec.get("currency") or "?"
-        name = rec.get("event_name") or "?"
-        return (f"📢 {cur} — {name}\n"
-                f"Actual: {rec.get('actual')} | Forecast: {rec.get('forecast') or '—'} "
-                f"| Previous: {rec.get('previous') or '—'}"
-                f"{impact}{when_s}{bm_s}{lat_s}")
+        return self._card(rec)
 
     def _revision_message(self, ev):
-        cur = ev.get("currency") or "?"
-        name = ev.get("event_name") or "?"
-        return (f"✏️ REVISED — {cur} {name}\n"
-                f"Actual: {ev.get('actual')} (was {ev.get('old_actual')})")
+        card = self._card(ev)
+        old = ev.get("old_actual")
+        if old:
+            card += f"\n<i>\u270F\uFE0F Revised from {html.escape(str(old))}</i>"
+        return card
+
+
+    # ---------------- telegram commands (/test, /upcoming) -------------------
+    def _dispatch_cmd(self, cmd: str, chat_id: str, msg_id=None):
+        if chat_id != str(C.TELEGRAM_CHAT_ID):
+            jlog(log, "tg_cmd_ignored", cmd=cmd, chat=str(chat_id)[:6] + "...")
+            return
+        now = mono_ms()
+        if now - self._last_cmd_mono < 5000:      # anti-flood
+            return
+        self._last_cmd_mono = now
+        jlog(log, "tg_command", cmd=cmd)
+        if msg_id:
+            self.tg.delete_message(chat_id, msg_id)   # keep the channel clean
+        if cmd == "/test":
+            self._cmd_test(chat_id)
+        elif cmd in ("/upcoming", "/next"):
+            self._cmd_upcoming(chat_id)
+        elif cmd in ("/start", "/help"):
+            self.tg.reply(
+                "<b>Commands</b>\n"
+                "/test \u2014 instant sample release cards (incl. live edit demo)\n"
+                "/upcoming \u2014 next 3 real events from the page", chat_id)
+
+    def _cmd_test(self, chat_id: str):
+        tag = f"__demo_{mono_ms()}__"
+        demo = [
+            {"impact": "high", "event_name": "Nonfarm Payrolls (Sep)",
+             "currency": "USD", "country": "US",
+             "actual": "254K", "forecast": "147K", "previous": "142K"},
+            {"impact": "medium", "event_name": "S&P Global Services PMI (Sep)",
+             "currency": "AUD", "country": "AU",
+             "actual": "51.4", "forecast": "51.4", "previous": "51.4"},
+            {"impact": "high", "event_name": "CPI (YoY) (Sep)",
+             "currency": "USD", "country": "US",
+             "actual": "3.2%", "forecast": "3.3%", "previous": "3.4%"},
+        ]
+        self.tg.reply(self._card(demo[0]), chat_id)
+        time.sleep(0.4)
+        # this one goes through the queue with an edit_key so the revision
+        # below EDITs it live - subscribers see exactly this behaviour
+        self.tg.release(self._card(demo[1]), dedup_key=(tag, "1"), edit_key=tag)
+        time.sleep(0.4)
+        self.tg.reply(self._card(demo[2]), chat_id)
+        time.sleep(2.5)
+        rev = dict(demo[1], actual="52.1", old_actual="51.4")
+        self.tg.revision(self._revision_message(rev),
+                         dedup_key=(tag, "2"), edit_key=tag)
+        time.sleep(1.0)
+        self.tg.reply(
+            "\u2705 Format test complete \u2014 cards above are exactly what "
+            "subscribers see on real releases.", chat_id)
+
+    def _cmd_upcoming(self, chat_id: str):
+        try:
+            rows = json.loads(self.page.evaluate(_UPCOMING_JS))
+        except Exception as e:
+            self.tg.reply(f"\u26a0\ufe0f Could not read the page: {html.escape(str(e)[:100])}",
+                          chat_id)
+            return
+        if not rows:
+            self.tg.reply("\U0001F4ED No upcoming timed events on the current "
+                          "page (quiet market).", chat_id)
+            return
+        lines = ["<b>Next up (page time, UTC)</b>"]
+        for r in rows:
+            dot = self._IMPACT_DOT.get((r.get("impact") or "").lower(), "\u26aa")
+            t = html.escape(str(r.get("time") or ""))
+            cur = html.escape(str(r.get("currency") or ""))
+            name = html.escape(str(r.get("name") or ""))
+            lines.append(f"{dot} <i>{t}</i> \u2014 {self._flag(r)} <b>{cur}</b> {name}")
+        self.tg.reply("\n".join(lines), chat_id)
 
     def _resource_log(self):
         rss_mb = _rss_mb()

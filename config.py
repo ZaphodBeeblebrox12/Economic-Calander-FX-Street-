@@ -70,6 +70,16 @@ CURRENCIES = ["USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF", "CNY",
               "HKD", "SGD", "KRW", "INR", "BRL", "MXN", "ZAR", "SEK", "NOK",
               "DKK", "PLN", "TRY", "XAU", "XAG"]
 
+# Country management - the probe rewrites the eventDates request, so you
+# never touch the site filter panel. Comma-separated ISO codes.
+#   ADD:    countries appended to every data fetch (e.g. "IN" = India/INR)
+#   REMOVE: countries stripped from the site default list (e.g. "UA" = Ukraine)
+EXTRA_COUNTRIES = "IN"
+REMOVE_COUNTRIES = "UA"
+
+# optional saved site state (filter cookies etc.) written by set_filters.py
+FXS_STATE_FILE = "fxs_state.json"
+
 # challenge / block page markers (title or body text)
 CHALLENGE_MARKERS = [
     "checking your browser", "verify you are human", "captcha", "access denied",
