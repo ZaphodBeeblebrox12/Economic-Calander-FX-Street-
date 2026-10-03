@@ -75,7 +75,7 @@ CURRENCIES = ["USD", "EUR", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF", "CNY",
 #   ADD:    countries appended to every data fetch (e.g. "IN" = India/INR)
 #   REMOVE: countries stripped from the site default list (e.g. "UA" = Ukraine)
 EXTRA_COUNTRIES = "IN"
-REMOVE_COUNTRIES = "UA"
+REMOVE_COUNTRIES = "UA", "GR", "BE", "ES", "PH", "TH"
 
 # optional saved site state (filter cookies etc.) written by set_filters.py
 FXS_STATE_FILE = "fxs_state.json"
