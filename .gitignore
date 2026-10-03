@@ -1,0 +1,10 @@
+# secrets
+.env
+
+# probe output
+logs/
+output/
+
+# python
+__pycache__/
+*.pyc
