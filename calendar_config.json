@@ -1,0 +1,24 @@
+{
+  "_comment": "Multi-source calendar rig config. track_currencies: only these ISO-4217 codes reach Telegram; [] = track everything. backfill_hours: events older than this when first seen are recorded but not sent (stops the MQL5 week-dump blast). Filter applies at the merge layer -> one list governs ALL sources, including FXStreet when its adapter locks in.",
+  "track_currencies": [
+    "AUD",
+    "NZD",
+    "JPY",
+    "CNY",
+    "HKD",
+    "INR",
+    "SGD",
+    "KRW",
+    "EUR",
+    "GBP",
+    "CHF",
+    "SEK",
+    "NOK",
+    "ZAR",
+    "BRL",
+    "MXN",
+    "CAD",
+    "USD"
+  ],
+  "backfill_hours": 2
+}

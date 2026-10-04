@@ -8,3 +8,14 @@ output/
 # python
 __pycache__/
 *.pyc
+investing_profile/
+edge_profile_copy/
+cf_clearance.txt*
+*_releases.jsonl
+investing_diagnostic.json
+investing___NEXT_DATA__.json
+investing_endpoint_sample.json
+mql5_diagnostic.json
+mql5_map.json
+mql5_script_blob_0.txt
+latency_race.jsonl
